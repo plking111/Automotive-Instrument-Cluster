@@ -58,16 +58,16 @@ F1_2/        # F103‑B按键告警从机
 > 
 > 需要根据自己 OneNET 平台设备信息、WiFi 信息修改以下头文件宏定义：
 1.`MID/ota_http.h` OTA 升级相关平台参数
-#define OTA_PRODUCT_ID      ""    // OneNET产品ID
-#define OTA_DEVICE_NAME     ""    // 设备名称
-#define OTA_USER_ID         ""    // 用户ID
-#define OTA_AUTHORIZATION   ""    // 鉴权token
+>#define OTA_PRODUCT_ID      ""    // OneNET产品ID
+>#define OTA_DEVICE_NAME     ""    // 设备名称
+>#define OTA_USER_ID         ""    // 用户ID
+>#define OTA_AUTHORIZATION   ""    // 鉴权token
 2.`MID/ESP_MQTT.h` MQTT 与 WiFi 配置
-#define MQTT_PRODUCT_ID     ""     // OneNET产品ID
-#define MQTT_DEVICE_NAME    ""     // 设备名称
-#define MQTT_AUTH_PARAM     ""     // MQTT鉴权参数
-#define USER_SSID           ""     // 连接WiFi名称
-#define USER_PASS           ""     // WiFi密码
+>#define MQTT_PRODUCT_ID     ""     // OneNET产品ID
+>#define MQTT_DEVICE_NAME    ""     // 设备名称
+>#define MQTT_AUTH_PARAM     ""     // MQTT鉴权参数
+>#define USER_SSID           ""     // 连接WiFi名称
+>#define USER_PASS           ""     // WiFi密码
 
 ## 📚 复刻本项目需要掌握的知识
 - BootLoader 原理、STM32 启动流程、中断向量表重定向、片上 Flash 分区管理
