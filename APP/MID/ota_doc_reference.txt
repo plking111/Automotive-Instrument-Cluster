@@ -1,0 +1,503 @@
+STM32F407 + OneNET 平台OTA 远程固件升级技术方案
+基于 ESP8266 WiFi 模块 + W25Q128 外部 FlashMQTT 通信 + HTTP OTA 固件下载支持固件回滚 · 防变砖保护 · 三区存储架构
+文档版本：V2.0（修订版）日期：2026年08月07日硬件平台：STM32F407ZGT6
+目  录
+一、OTA 升级原理
+    1.1 OTA 概述
+    1.2 OneNET OTA 架构
+    1.3 W25Q128 三区存储设计（★ 核心设计）
+    1.4 升级流程总览（含回滚路径）
+二、OTA 服务器连接
+    2.1 设备鉴权与签名算法
+    2.2 HTTP API 基地址
+    2.3 MQTT 与 OTA 的关系
+    2.4 设备端网络通信架构
+三、OTA 通信协议详解
+    3.1 上报设备版本号 (POST)
+    3.2 检查升级任务 (GET)
+    3.3 校验 Token 有效性 (GET)
+    3.4 分片下载固件 (GET + Range)
+    3.5 上报升级状态 (POST)
+    3.6 状态码完整定义
+    3.7 错误码参考
+四、OTA 升级完整流程（含回滚机制）
+    4.1 平台侧操作步骤
+    4.2 设备侧升级步骤
+    4.3 BootLoader 完整设计（含回滚逻辑）
+    4.4 三区联动：升级-备份-标志的协作流程
+    4.5 断点续传机制
+    4.6 异常处理与容错（含回滚触发条件）
+五、代码结构与实现
+    5.1 推荐工程文件结构
+    5.2 标志区数据结构设计
+    5.3 OTA 任务模块 (ota_task.c/h)
+    5.4 HTTP 客户端模块 (ota_http.c/h)
+    5.5 BootLoader 完整代码（含备份与回滚）
+    5.6 MQTT 集成 OTA 通知接收
+    5.7 FreeRTOS OTA 任务示例
+六、参考资料
+一、OTA 升级原理
+1.1 OTA 概述
+OTA（Over-The-Air，空中下载技术）是一种通过无线网络对嵌入式设备的固件进行远程升级的技术。对于本项目的 STM32F407ZGT6 + ESP8266 平台而言，OTA 升级意味着：设备通过 ESP8266 WiFi 模块连接到互联网，从 OneNET 云平台接收升级通知和下载固件包，将新固件写入外部 Flash（W25Q128）的"升级固件区"，由 BootLoader 负责固件搬运和自动回滚，APP 负责升级成功后备份固件，实现安全可靠的远程升级。
+1.2 OneNET OTA 架构
+OneNET 平台的 OTA 服务采用 "MQTT 通知 + HTTP 下载" 的混合架构：
+MQTT 通道（实时通知）：
+设备通过 MQTT 长连接保持在线，可实时接收平台下发的 OTA 升级通知。
+MQTT 主题：$sys/{产品ID}/{设备名}/thing/property/set —— 平台可下发 JSON 格式的升级指令。
+HTTP 通道（固件传输）：
+固件升级包较大（几十KB ~ 几百KB），不适合通过 MQTT 传输。
+OTA 服务使用 HTTP RESTful API，设备通过 HTTP 请求完成：版本上报 → 任务查询 → Token 校验 → 分片下载固件 → 状态上报。
+OTA 服务器域名：ota.heclouds.com（端口 80），新版 API：iot-api.heclouds.com
+整体的数据流与存储架构如下图所示：
+┌──────────────────────────────────────────────────────┐│                  OneNET 云平台                         ││  ┌──────────┐       ┌──────────────┐                  ││  │ MQTT 服务 │       │ OTA HTTP 服务 │                  ││  │ (1883)   │       │ (80)         │                  ││  └────┬─────┘       └──────┬───────┘                  │└───────┼────────────────────┼──────────────────────────┘        │ MQTT 长连接         │ HTTP 短连接        │ (通知/上报)         │ (固件下载)        │                    │   ┌────┴────────────────────┴────┐   │      ESP8266 WiFi 模块        │   │   (AT固件: MQTT + TCP/IP)    │   └────────────┬─────────────────┘                │ UART6 (AT指令)   ┌────────────┴─────────────────────────────┐   │           STM32F407ZGT6                   │   │  ┌──────────────────────────────────┐    │   │  │  APP  (片上Flash 0x08010000)     │    │   │  │  - MQTT通信 / OTA下载 / HTTP客户端│    │   │  └──────────────────────────────────┘    │   │  ┌──────────────────────────────────┐    │   │  │  Boot (片上Flash 0x08000000)     │    │   │  │  - 三区管理 / 固件搬运 / 回滚保护 │    │   │  └──────────────────────────────────┘    │   │                                          │   │  ┌──────────────────────────────────────────┐   │  │       W25Q128 (16MB 外部Flash)           │   │  │  ┌─────────┬─────────┬──────────┬─────┐  │   │  │  │ 升级固件 │ 备份区   │  标志区   │保留 │  │   │  │  │   区     │(旧固件) │(Flag)   │     │  │   │  │  │ (6MB)   │ (6MB)   │ (64KB)  │     │  │   │  │  └─────────┴─────────┴──────────┴─────┘  │   │  └──────────────────────────────────────────┘   └──────────────────────────────────────────────┘
+1.3 W25Q128 三区存储设计（★ 核心设计）
+为了保证 OTA 升级的安全性和可靠性，防止升级过程中意外断电导致设备变砖，W25Q128（16MB）被划分为三个功能区。这是本方案最核心的设计思想。
+1.3.1 分区总览
+分区编号
+分区名称
+W25Q128 起始地址
+分区大小
+功能说明
+读写者
+-
+BootLoader
+0x08000000(片上Flash)
+64 KB
+上电首先运行，负责判断升级/回滚/跳转
+只读
+-
+APP 程序
+0x08010000(片上Flash)
+960 KB
+主应用程序（含 MQTT + OTA 下载功能）
+Boot写入, CPU执行
+区1
+升级固件区
+0x00000000
+6 MB(0x600000)
+存放 OTA 任务下载的最新固件包（.bin）
+APP写入, Boot读取
+区2
+备份区
+0x00600000
+6 MB(0x600000)
+存放上一个版本的固件，用于升级失败时回滚
+Boot写入(搬运旧固件), Boot读取(回滚)
+区3
+标志区
+0x00C00000
+64 KB(0x10000)
+存放升级标志位、保护标志位、版本信息等关键元数据
+APP写入标志, Boot读取并判断
+1.3.2 标志区详细设计（区3）
+标志区是整个三区方案的控制核心，BootLoader 上电后首先读取该区域来决定后续行为。标志区固定位于 W25Q128 最后一个 64KB 块（0x00C00000 ~ 0x00C0FFFF），组织如下：
+字段
+偏移地址
+大小
+说明
+示例值
+升级标志位(upgrade_flag)
+0x00C00000
+4 Bytes
+0xAA55AA55 = 有待升级固件（Boot执行升级）0x55AA55AA = 升级已完成待确认0x00000000 = 无升级任务
+0xAA55AA55
+保护标志位(protect_flag)
+0x00C00004
+4 Bytes
+0xBB66BB66 = APP已验证成功（新固件正常运行后写入）其他值 = 升级未确认
+0xBB66BB66
+当前运行版本(current_ver)
+0x00C00010
+24 Bytes
+字符串，当前正在运行的固件版本号
+"V1.0.0"
+新固件版本(new_ver)
+0x00C00030
+24 Bytes
+字符串，升级固件区中存储的新固件版本号
+"V1.0.1"
+备份固件版本(backup_ver)
+0x00C00050
+24 Bytes
+字符串，备份区中存储的旧固件版本号
+"V0.9.0"
+升级固件大小(fw_size)
+0x00C00070
+4 Bytes
+升级固件区中 .bin 文件的大小（字节）
+262144
+启动失败计数(boot_fail_cnt)
+0x00C00080
+4 Bytes
+看门狗复位计数，超过阈值则触发回滚
+0 / 1 / 2 / 3
+1.3.3 三区协作的核心原理
+以下通过一个完整的升级场景说明三个区如何协作（假设当前运行 V1.0.0，要升级到 V1.0.1）：
+【下载阶段 - APP负责】APP 从 OneNET 下载 V1.0.1 固件到"升级固件区"（区1），下载完成后将升级标志位设为 0xAA55AA55，将新固件版本号"V1.0.1"写入标志区（区3）的 new_ver 字段，然后软件复位。
+【搬运阶段 - Boot负责】BootLoader 上电后读取区3，发现升级标志位 = 0xAA55AA55，开始执行升级：① 擦除片上 Flash APP 区（0x08010000）② 从"升级固件区"（区1）读取 V1.0.1 固件，写入片上 Flash APP 区③ 校验新固件栈地址（SP）是否合法④ 更新区3的标志：升级标志位 = 0x55AA55AA（已搬运待确认），启动失败计数+1⑤ 跳转到新 APP（V1.0.1）★ 注意：BootLoader 不做备份操作！备份由 APP 确认升级成功后执行。
+【确认阶段 - APP负责】V1.0.1 固件启动后，完成 WiFi 和 MQTT 初始化，确认固件功能正常后：① ★ 备份新固件：将"升级固件区"（区1）的 V1.0.1 固件复制到"备份区"（区2）② 将保护标志位写入 0xBB66BB66（表示"新固件已验证OK"）③ 更新标志区：current_ver = "V1.0.1", backup_ver = "V1.0.1"④ 上报升级成功（状态码 201）如果 APP 在完成备份和写入保护标志位之前崩溃（看门狗复位），BootLoader 将检测到保护标志位不正确，触发回滚。（此时区2中仍是上一个成功版本，可以安全回滚）
+【回滚阶段 - Boot负责（关键安全机制）】BootLoader 上电后，如果发现升级标志位 = 0x55AA55AA 但保护标志位 ≠ 0xBB66BB66，说明上次升级后新 APP 未能成功运行确认。此时执行回滚：① 从"备份区"（区2）读取旧固件 V1.0.0② 擦除片上 Flash APP 区③ 将旧固件写入 APP 区④ 清除升级标志位和启动失败计数⑤ 跳转回旧 APP这样即使升级失败，设备也能自动恢复到上一个正常工作的固件版本，不会变砖。
+1.4 升级流程总览（含回滚路径）
+┌─────────────────────────────────────────────────────────────────┐│                      设备上电 → BootLoader 运行                    │├─────────────────────────────────────────────────────────────────┤│  读取标志区（区3）                                                 ││    │                                                             ││    ├── 升级标志=0xAA55AA55 且 保护标志=0xBB66BB66 ──────────────┐  ││    │   (升级已完成且APP已确认，正常情况)                          │  ││    │   → 直接跳转APP                                             │  ││    │                                                             │  ││    ├── 升级标志=0xAA55AA55 且 保护标志≠0xBB66BB66 ──────────────┐│  ││    │   ★ 升级已完成搬运但APP未能确认 → 触发回滚！               ││  ││    │   → 从备份区(区2)恢复旧固件 → 清除标志 → 跳转回旧APP       ││  ││    │                                                             ││  ││    ├── 升级标志=0xAA55AA55 且 保护标志=0 (首次检测到升级任务) ──┐││  ││    │   → 擦除APP区 → 从区1搬运新固件 → 设升级标志=0x55AA55AA    │││  ││    │   → 跳转新APP → 功能正常                                     │││  ││    │   → ★ APP备份区1固件到区2 → 设保护标志=0xBB66BB66 → 完成   │││  ││    │   → 新APP启动 → 看门狗复位 → 重新进入Boot → 触发回滚       │││  ││    │                                                             │││  ││    └── 升级标志=0 (无升级) ─────────────────────────────────────┐│││  ││        → 检查APP区是否有效 → 直接跳转APP                        ││││  ││        → APP区无效 → 尝试从备份区恢复 → 仍失败则停机             ││││  │└─────────────────────────────────────────────────────────────────┘││││  │                                                                   ││││  │  ┌────────────────────────────────────────────────────────────────┘│││  │  │            APP 正常运行中（MQTT + LVGL + 业务逻辑）              │││  │  ├─────────────────────────────────────────────────────────────────┤││  │  │  ┌─ 收到OTA通知 / 定时轮询检查升级任务 ─────────────────────────┘││  │  │  │  ① HTTP上报版本号 → ② 检查任务 → ③ 下载固件到W25Q128区1     ││  │  │  │  ④ MD5校验 → ⑤ 上报下载完成 → ⑥ 设置升级标志=0xAA55AA55     ││  │  │  │  ⑦ 设置 new_ver → ⑧ NVIC_SystemReset() ─────────────────────┘│  │  │  │                                                                 │  │  │  └─ 新APP启动成功 ─────────────────────────────────────────────────┘  │  │     ① 设置保护标志=0xBB66BB66（确认升级成功）                         │  │     ② 更新 current_ver = new_ver                                      │  │     ③ 上报升级状态 201                                                │  │                                                                        │  └─ 回滚后旧APP重新运行 ──────────────────────────────────────────────────┘      ① 上报升级失败状态 206      ② 通知平台回滚完成
+二、OTA 服务器连接
+2.1 设备鉴权与签名算法
+OneNET OTA 服务的所有 HTTP API 都需要在请求头中携带 Authorization 鉴权信息。签名算法使用 HMAC-SHA1，与 MQTT 连接的 token 鉴权不同（但算法思想类似）。
+2.1.1 Authorization 头部格式
+新版融合API（iot-api.heclouds.com）使用以下鉴权格式（推荐使用）：
+version=2022-05-01&res=userid%2F{用户ID}&et={过期时间戳}&method=sha1&sign={签名结果}
+旧版通用API（ota.heclouds.com）使用以下鉴权格式：
+version=2018-10-31&res=products%2F{产品ID}&et={过期时间}&method=sha1&sign={签名}
+参数说明：
+参数
+说明
+version
+鉴权版本号。新版API填 2022-05-01，旧版API填 2018-10-31
+res
+资源路径。新版API: userid/{用户ID}，旧版API: products/{产品ID}（需URL编码 %2F）
+et
+过期时间，Unix 时间戳（建议设为当前时间 + 86400秒即24小时）
+method
+签名算法：sha1 / sha256 / md5（推荐 sha1）
+sign
+签名结果，Base64 编码
+2.1.2 签名生成步骤
+完整的签名计算过程如下（STM32 上使用 mbedtls 库实现）：
+1. 获取 access_key：在 OneNET 控制台 → 产品详情 → access_key（Base64编码的密钥）
+2. 拼接签名字符串：{et}\n{method}\nproducts/{product_id}\n{version}（注意是用 \n 换行符分隔）
+3. 对 access_key 进行 Base64 解码，得到 hmac_key（二进制密钥）
+4. 使用 hmac_key 对签名字符串进行 HMAC-SHA1 计算，得到 20 字节的摘要
+5. 将摘要进行 Base64 编码，得到最终 sign 值
+6. 将所有参数拼成 Authorization 头部值（注意需要对特殊字符进行 URL 编码）
+签名字符串示例：
+新版API示例（推荐）：假设：et=1735660800, method=sha1, userid=12345, version=2022-05-01签名字符串为：1735660800\nsha1\nuserid/12345\n2022-05-01旧版API示例：1735660800\nsha1\nproducts/245528\n2018-10-31
+2.2 HTTP API 基地址
+OneNET OTA 提供两个版本的 API，本方案以新版融合API为主、旧版通用API为辅：
+API 版本
+基地址
+鉴权版本
+说明
+新版融合 OTA（★ 推荐）
+https://iot-api.heclouds.com
+2022-05-01
+使用 pro_id+dev_name 标识设备，tid 标识任务。res格式为 userid/{用户ID}
+旧版通用 OTA
+http://ota.heclouds.com
+2018-10-31
+使用 dev_id 标识设备，token 标识任务。res格式为 products/{产品ID}
+注意：ESP8266 通过 AT+CIPSTART 建立 TCP 连接。新版API使用 HTTPS（端口443），旧版API使用 HTTP（端口80）。如果 ESP8266 不支持 SSL/TLS，可使用旧版 HTTP API 或在 SDK 中将 CONFIG_NETWORK_TLS 设为 0 关闭 TLS。
+2.3 MQTT 与 OTA 的关系
+通信方式
+用途
+特点
+MQTT
+设备在线保活、数据上报、接收 OTA 升级通知
+长连接、实时性高、数据量小
+HTTP (OTA API)
+上报版本号、查询任务、下载固件包、上报状态
+短连接、支持分片下载、大数据量
+HTTP (固件下载)
+通过 Range 头分片拉取固件二进制数据
+支持断点续传、可分片校验
+2.4 设备端网络通信架构
+由于 ESP8266 的 AT 固件限制，同一时刻只能有一个 TCP 连接处于活跃状态，需要采用分时复用策略：
+正常运行阶段：保持 MQTT 长连接（mqtts.heclouds.com:1883）。
+OTA 下载阶段：暂停 MQTT 心跳，断开 MQTT，建立 HTTP 连接到 ota.heclouds.com:80。
+OTA 完成后：恢复 MQTT 连接，继续正常通信。
+三、OTA 通信协议详解
+本章详细列出 OTA 升级过程中设备端需要调用的每一个 HTTP API。所有 API 均需在 HTTP 请求头中添加 Authorization 鉴权信息。
+3.1 上报设备版本号 (POST)
+设备启动后或首次升级时，需要将当前固件版本号上报到平台。这是 OTA 流程的第一步。
+请求方式：POST
+URL：http://ota.heclouds.com/ota/device/version?dev_id={设备ID}
+请求头：
+Content-Type: application/jsonAuthorization: version=2018-10-31&res=products%2F{产品ID}&et={过期时间}&method=sha1&sign={签名}
+请求体（JSON）：
+{"s_version": "V1.0.0"}    // SOTA: MCU应用版本号
+版本号格式要求：只能包含 [a-zA-Z0-9_\-.] ，长度 1~20 字符。
+3.2 检查升级任务 (GET)
+设备调用此 API 查询是否存在待处理的升级任务。平台会比对设备上报的版本号与目标版本号，如果不一致且存在升级任务，则返回任务详情。
+请求方式：GET
+★ 新版融合API（推荐）：GET https://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/check?type={类型}&version={当前版本}
+旧版通用API：GET http://ota.heclouds.com/ota/south/check?dev_id={设备ID}&manuf={厂商编号}&model={模组型号}&type={类型}&version={当前版本}&cdn={是否返回IP}
+新版API请求参数：
+参数
+说明
+示例值
+dev_id
+设备ID（数字）
+32981907
+manuf
+厂商编号（SOTA填100）
+100
+model
+芯片型号编号
+10001
+type
+升级类型：1=FOTA, 2=SOTA
+2
+version
+当前固件版本号
+V1.0.0
+cdn
+是否返回CDN下载IP
+false
+成功返回示例（data 字段）：
+{    "errno": 0,    "error": "succ",    "data": {        "target": "V1.0.1",        // 目标版本号        "tid": 12,                 // 任务ID（替代旧版token）        "size": 262144,             // 固件大小（字节）        "status": 1,               // 1=待下发, 2=已下发, 3=已响应        "type": 1                  // 1=完整包, 2=差分包        "retry": 10,                // 最大重试次数（仅旧版API返回）        "interval": 90,             // 重试间隔（仅旧版API返回）        "md5": "d41d8cd98f00b...",  // 固件MD5校验值        "ipPort": "183.230.40.50",  // 下载服务器IP（仅旧版API返回）        "type": 1                   // 1=完整包, 2=差分包    }}
+重要说明：
+token 是后续所有操作的关键凭证，有效期仅 48 小时。必须持久化到标志区。
+如果 errno=11 表示没有升级任务，errno=0 表示有任务。
+3.3 校验 Token 有效性 (GET)
+Token 有 48 小时有效期。在开始下载固件前，建议先校验 Token 是否仍然有效。
+请求方式：GET
+★ 新版融合API：GET https://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/check （检测升级状态）
+旧版通用API：GET http://ota.heclouds.com/ota/south/download/{token}/check?dev_id={设备ID}
+3.4 分片下载固件 (GET + Range)
+这是 OTA 升级中最核心的步骤。设备通过 HTTP Range 头部实现分片下载，每片下载完成后写入 W25Q128 的"升级固件区"（区1），并上报进度。
+支持断点续传：网络中断后可以从上次断点继续下载，不用重新开始。
+内存占用小：每次只需分配几 KB 的接收缓冲区。
+进度可控：可以精确上报下载百分比给平台。
+请求方式：GET
+★ 新版融合API：GET https://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/download
+旧版通用API：GET http://ota.heclouds.com/ota/south/download/{token}
+Range 头部格式：
+格式
+说明
+示例
+Range: bytes={start}-
+从第 start+1 字节到末尾
+Range: bytes=0- (获取全部)
+Range: bytes={start}-{end}
+获取指定范围
+Range: bytes=0-1023 (前1KB)
+Range: bytes=-{end}
+获取最后 end 个字节
+Range: bytes=-100 (最后100字节)
+响应头关键字段（新版API）：
+Content-Disposition: 包含 filename 固件文件名
+Content-Range: 格式 bytes {start}-{end}/{total}，total 为文件总字节数
+Content-Length: 当前分片的实际数据字节数
+Ota-Errno: 下载错误码。0=成功, 1=设备不存在, 2=文件资源不存在, 3=存储资源不存在, 4=文件大小不一致, 5=任务已完成/取消, 6=鉴权失败
+分片下载代码思路：
+// 分片下载固件到 W25Q128 升级固件区（区1）#define CHUNK_SIZE      4096#define W25Q_FW_ZONE1   0x00000000   // 升级固件区起始地址void OTA_DownloadToZone1(const char *token, uint32_t total_size, const char *ip){    uint32_t offset = 0;    uint8_t buf[CHUNK_SIZE];    uint32_t w25q_addr = W25Q_FW_ZONE1;    // 先擦除区1（按64KB块擦除，确保干净）    for (uint32_t addr = W25Q_FW_ZONE1;         addr < W25Q_FW_ZONE1 + total_size;         addr += 65536) {        W25Q128_BlockErase_64K(addr);    }    while (offset < total_size) {        uint32_t end = (offset + CHUNK_SIZE - 1 < total_size)                       ? (offset + CHUNK_SIZE - 1) : (total_size - 1);        ESP_Connect_TCP(ip, 80, 5000);        char http_req[512];        sprintf(http_req,            "GET /ota/south/download/%s HTTP/1.1\r\n"            "Host: ota.heclouds.com\r\n"            "Authorization: %s\r\n"            "Range: bytes=%lu-%lu\r\n\r\n",            token, g_ota_auth, offset, end);        ESP_SendToTCPServer(http_req, 10000);        uint16_t data_len = parse_http_response(TCPdata, buf, CHUNK_SIZE);        W25Q128_Write(w25q_addr + offset, buf, data_len);  // ★ 写入区1        offset += data_len;        OTA_ReportProgress(token, offset * 100 / total_size);        // 持久化断点信息到标志区        OTA_SaveResumePoint(offset);    }}
+3.4.1 固件 .bin 文件格式要求
+OTA 下载的固件必须是 .bin 格式（原始二进制），不能使用 .hex 文件。编写 APP 工程时需要注意：
+1. APP 程序起始地址必须是 0x08010000（Keil → Options → Target → IROM1 → Start = 0x08010000, Size = 0xF0000）。
+2. main() 函数开头必须设置向量表偏移：SCB->VTOR = 0x08010000;（当前 APP 工程已正确设置）。
+3. 编译后使用 fromelf 工具将 .axf 转为 .bin：fromelf --bin -o output.bin input.axf
+4. .bin 文件的第一个字（4字节）必须是栈顶地址（MSP初始值，应在 0x20000000~0x20020000 范围内），第二个字是复位向量（0x08010001）。BootLoader 通过检查这两个值来验证固件是否有效。
+5. 上传到 OneNET 平台的固件必须是这个 .bin 文件。平台自动计算 MD5 并记录版本号。
+3.5 上报升级状态 (POST)
+设备在升级过程中需要通过 HTTP POST 向平台上报当前进度和状态。OneNET 平台提供两种上报方式（progress 和 report），推荐使用 progress 接口。注意：两种接口的数值含义不同，切勿混淆。
+方式一：progress 接口（推荐）
+★ 新版融合API：POST https://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/status （统一的上报接口）
+旧版通用API：POST /ota/south/device/download/{token}/progress?dev_id={设备ID}
+请求体：{"step": 54}  // step 范围 0~100 表示下载进度百分比
+★ 重要：上报 step=100 时，平台自动将设备状态从"正在下载"切换为"正在升级"。
+因此，下载完成后上报 step=100（而不是101），然后由 BootLoader 完成固件搬运，新 APP 启动后再调用 report 接口上报 result=201（升级成功）。
+方式二：report 接口
+★ 新版融合API：POST https://iot-api.heclouds.com/fuse-ota/{pro_id}/{dev_name}/{tid}/status （同上接口）
+旧版通用API：POST /ota/south/report?dev_id={设备ID}&token={token}
+请求体：{"result": 101}  // 这里用 result 字段，101=下载成功
+使用此接口需要调用两次：先报 result=101（下载成功），再报 result=201（升级成功）。
+注意：progress 接口的 step=100 等同于 report 接口的 result=101，都表示下载完成。
+两种接口对照表：
+阶段
+progress 接口 (step 字段)
+report 接口 (result 字段)
+下载中
+step = 0~99 (进度百分比)
+无需上报（可定时报进度百分比）
+下载完成
+step = 100（★ 触发状态切换）
+result = 101
+升级完成
+不支持（progress接口到100为止）
+result = 201
+升级失败
+不支持
+result = 2xx（各种失败码）
+★ 推荐做法：下载过程中使用 progress 接口上报进度（step=0~99），下载完成后上报 step=100（切换到"正在升级"状态），BootLoader 搬运完成、新 APP 成功启动后，使用 report 接口上报 result=201（升级成功）。
+3.6 状态码完整定义
+状态码
+含义
+0~100
+下载进度百分比。新版API中 step<=100 为下载进度，step=100 触发状态切换为'正在升级'。注意：上报100后不要再上报101。
+101
+升级包下载成功（step>100时等同于状态码）。注意：新API中 step=100 或 101 都表示下载完成，二者等效。
+102
+下载失败：存储空间不足
+103
+下载失败：内存溢出
+104
+下载失败：下载请求超时
+105
+下载失败：电量不足
+106
+下载失败：信号不良
+107
+下载失败：未知异常
+201
+升级成功（必须在新APP启动后上报）
+202
+升级失败：电量不足
+203
+升级失败：内存溢出
+204
+升级失败：版本不一致
+205
+升级失败：MD5校验失败
+206
+升级失败：未知异常（含回滚失败）
+207
+升级失败：达到最大重试次数
+208
+设备升级过期
+3.7 错误码参考
+错误码
+说明
+0
+操作成功 / 存在升级任务
+1
+鉴权失败
+2
+请求参数错误
+7
+OneNET 内部错误
+8
+manuf 或 model 不一致
+9
+版本号不一致
+11
+没有检测到升级任务
+20
+升级任务已经完成
+22
+升级任务已被取消
+27
+版本号格式错误
+32
+存在升级任务但无对应差分包
+四、OTA 升级完整流程（含回滚机制）
+4.1 平台侧操作步骤
+在设备端开发之前，需要先在 OneNET 平台完成以下配置：
+1. 登录 OneNET 开发者中心（https://open.iot.10086.cn），进入已创建的产品。
+2. 在左侧菜单找到"OTA 远程升级" → "固件管理" → "添加固件"。上传编译好的 .bin 固件文件，填写版本号。
+3. 在"升级任务管理"中创建升级任务：选择目标固件版本、选择设备、配置升级策略。
+4. 平台将升级任务下发给目标设备。设备下次查询时即可获取到任务。
+5. 在"设备管理"中查看设备的升级状态。
+4.2 设备侧升级步骤
+设备侧完整的 OTA 升级流程（含三区联动和回滚逻辑）：
+步骤1：设备启动 → BootLoader 判断
+BootLoader 上电后首先读取标志区（区3）的三个关键字段：a) 升级标志位 upgrade_flagb) 保护标志位 protect_flagc) 启动失败计数 boot_fail_cnt根据这些字段的值决定走"正常跳转"、"执行升级"还是"触发回滚"路径。详见 4.3 节 BootLoader 设计。
+步骤2：APP 正常运行与版本上报
+APP 启动后：连接 WiFi → 连接 MQTT → 调用 HTTP POST 上报当前版本号（读取标志区 current_ver）。如果保护标志位尚未写入（这是新固件首次启动），在功能初始化完成后写入 protect_flag = 0xBB66BB66。
+步骤3：接收 OTA 升级通知
+方式A（MQTT 下发）：平台通过 property/set 主题下发升级通知，在 ESP_MQTT_MsgProcess() 中解析触发。方式B（主动轮询）：定时调用 HTTP GET /ota/south/check 查询升级任务。
+步骤4：检查升级任务并获取信息
+调用 /ota/south/check 接口。如果 errno=0，提取 token、target、size、md5、ipPort。比较 target 与标志区的 current_ver，如果相同说明已是最新，跳过升级。
+步骤5：升级条件检查
+检查：WiFi 信号强度、W25Q128 区1空间是否足够、版本号是否不同。条件不满足则暂缓升级。
+步骤6：分片下载固件到"升级固件区"（区1）
+a) 擦除区1对应区域b) HTTP Range 分片下载，每片 4096 字节c) 写入 W25Q128 区1（地址 0x00000000 起始）d) 每片上报进度，持久化断点信息（已下载字节数）到标志区e) 全部下载完成后计算 MD5，对比平台给的 md5
+步骤7：写入升级标志 → 通知 BootLoader
+MD5 校验通过后：a) 将新固件版本号写入标志区 new_ver 字段b) 将固件大小写入标志区 fw_size 字段c) 将升级标志位 upgrade_flag 设为 0xAA55AA55（★ 这是告诉 BootLoader 有新固件的关键操作）d) 上报下载完成（progress接口 step=100，触发设备状态切换为"正在升级"）e) 调用 NVIC_SystemReset() 软件复位
+步骤8：BootLoader 执行固件搬运
+BootLoader 重启后，检测到 upgrade_flag = 0xAA55AA55 且 protect_flag ≠ 0xBB66BB66：a) 擦除片上 Flash APP 区（0x08010000 ~ 0x080FFFFF）b) 搬运新固件：从 W25Q128"升级固件区"（区1）读取 .bin 数据，写入片上 Flash APP 区c) 校验栈地址（SP）合法性d) 更新标志区：升级标志位改为 0x55AA55AA，启动失败计数+1e) 跳转到新 APP★ BootLoader 不做备份！备份由 APP 在确认升级成功后完成。
+步骤9：新 APP 启动并确认升级
+新 APP 启动后：a) 连接 WiFi 和 MQTTb) 初始化各项功能，确认固件运行正常c) ★ 备份固件到备份区：将"升级固件区"（区1）的新固件复制到"备份区"（区2），作为下一个可回滚的版本d) ★ 将保护标志位 protect_flag 设为 0xBB66BB66（关键一步！告诉 BootLoader 升级成功）e) 更新标志区：current_ver = new_ver, backup_ver = new_verf) 上报升级成功（report接口 result=201）如果新 APP 在完成备份和写入保护标志位之前因看门狗复位而重启，BootLoader 将检测到 upgrade_flag = 0x55AA55AA 但 protect_flag ≠ 0xBB66BB66，触发回滚。（此时区2中仍是上一个成功版本，可以安全回滚）
+步骤10：升级失败 → 自动回滚
+触发回滚的条件（任一满足即触发）：a) 升级标志位 = 0x55AA55AA（已搬运完成）但保护标志位 ≠ 0xBB66BB66（APP未确认）b) 启动失败计数 boot_fail_cnt >= 3（看门狗反复复位超过阈值）c) 新APP区栈地址校验不通过回滚执行流程：① 从"备份区"（区2）读取旧固件② 擦除片上 Flash APP 区③ 写入旧固件到 APP 区④ 清除升级标志位、启动失败计数⑤ 跳转回旧 APP → 旧 APP 上报升级失败（206）
+4.3 BootLoader 完整设计（含回滚逻辑）
+BootLoader 是本方案的大脑，负责根据标志区的状态做出决策。以下是完整的状态机逻辑和代码设计。
+4.3.1 BootLoader 决策流程图
+BootLoader 启动    │    ├─ 1. 初始化：时钟 → 串口(USART2) → SPI1 → W25Q128    │    ├─ 2. 读取标志区（区3, 地址 0x00C00000）    │     upgrade_flag  @ 0x00C00000    │     protect_flag  @ 0x00C00004    │     boot_fail_cnt @ 0x00C00080    │    ├─ 3. 判断升级标志位    │   │    │   ├── upgrade_flag == 0x00000000 ─────────────────────┐    │   │   (无升级任务)                                      │    │   │   → 直接跳转 APP (0x08010000)                      │    │   │   → 如 APP 无效 → 尝试从备份区恢复 → 失败则停机     │    │   │                                                    │    │   ├── upgrade_flag == 0xAA55AA55 ──────────────────────┤    │   │   (检测到新固件，首次处理)                           │    │   │   → 执行【固件搬运流程】(见下方)                     │    │   │   → 升级标志改为 0x55AA55AA → 跳转新APP            │    │   │                                                    │    │   └── upgrade_flag == 0x55AA55AA ──────────────────────┤    │       (已搬运但待APP确认)                                │    │       │                                                 │    │       ├── protect_flag == 0xBB66BB66 ─────────────────┐│    │       │   (APP已验证成功！)                             ││    │       │   → 清除升级标志 → 直接跳转 APP                ││    │       │                                                 ││    │       └── protect_flag != 0xBB66BB66 ─────────────────┐││    │           ★★★ 升级失败！触发回滚！★★★                  │││    │           → 执行【回滚流程】(见下方)                    │││    │                                                         │││    └─────────────────────────────────────────────────────────┘││                                                               ││    【固件搬运流程（BootLoader执行）】                              ││    ① 擦除：擦除片上 Flash APP 区 (0x08010000 ~ 0x080FFFFF)    ││    ② 搬运：从升级固件区(区1)读取新固件 → 写入 APP 区          ││    ③ 校验：检查 APP 区栈地址 (SP) 是否合法                     ││    ④ 写标志：升级标志=0x55AA55AA, 失败计数+1                   ││    ⑤ 跳转新APP                                                ││    ★ BootLoader不做备份！备份由APP成功后执行                    ││                                                               ││    【APP确认与备份流程（新APP启动后执行）】                       ││    ① 新APP启动 → 初始化WiFi/MQTT → 确认功能正常               ││    ② ★ 备份：将升级固件区(区1)的新固件 → 复制到备份区(区2)    ││    ③ 写保护标志 protect_flag = 0xBB66BB66                      ││    ④ 更新 current_ver = new_ver, backup_ver = new_ver          ││    ⑤ 上报升级成功(201)                                         ││                                                               ││    【回滚流程】                                                 ││    ① 从备份区(区2)读取上一个成功版本的固件                     ││    ② 擦除片上 Flash APP 区                                     ││    ③ 写入旧固件到 APP 区                                       ││    ④ 校验栈地址                                                ││    ⑤ 清除所有标志：升级标志=0, 保护标志=0, 失败计数=0          ││    ⑥ 跳转回旧APP                                               ││    ⑦ 旧APP启动后上报升级失败(206)                              ││
+4.4 三区联动：升级-备份-标志的协作流程
+下面用时序图的方式总结 APP、BootLoader 和 W25Q128 三个区之间在完整升级周期中的协作关系：
+时间线 ────────────────────────────────────────────────────────────────────→[正常运行]           [OTA下载]          [Boot搬运]        [新APP确认]  或  [回滚]APP: 运行V1.0.0      APP: HTTP下载       APP: 复位中        APP: 启动V1.0.1     │                │                                     │     │                ├─保存到区1──→ 区1: [V1.0.1.bin]      ├─初始化WiFi/MQTT     │                │                                     │     │                ├─写标志区──→ 区3: upgrade_flag       ├─★备份:区1→区2     │                │              =0xAA55AA55            │  区2: [V1.0.1.bin]     │                │              new_ver="V1.0.1"       │     │                │                                     ├─protect_flag     │                ├─NVIC_System                           │ =0xBB66BB66     │                │  Reset()    ┌──────────────────┐    │ → 区3更新     │                │  ─────────→ │ BootLoader启动    │    │     │                │             │                  │    │  ★ 如果崩溃:     │                │             │ 检测upgrade=AA55 │    │  看门狗复位     │                │             │                  │    │   → Boot检测     │                │             │ ①擦除:APP区      │    │   protect≠BB66     │                │             │ ②搬运:区1→APP区  │    │   → 触发回滚!     │                │             │ ③校验栈地址     │    │     │                │             │ ④标志:upgrade=   │    │  回滚流程:     │                │             │   0x55AA55AA     │    │  区2→APP区     │                │             │ ⑤跳转新APP ──────→    │  (恢复成功版本)     │                │             └──────────────────┘    │     │                │                                     │  旧APP启动     │                │                                     │  上报206区1(升级固件区):      [空]            [V1.0.1.bin]      [V1.0.1.bin]区2(备份区):          [V1.0.0.bin]    [V1.0.0.bin]      [V1.0.0.bin]   ★APP备份后→[V1.0.1.bin]区3(标志区):          all=0           upgrade=AA55       upgrade=55AA   →回滚时清除                                      new_ver=V1.0.1     protect=BB66或空
+4.5 断点续传机制
+断点续传的关键是持久化已下载的字节偏移量。在本方案中，断点信息存储在标志区：
+断点存储位置：标志区（区3）的保留字段，如 0x00C00100 处，存储 downloaded_size（4字节）。
+每次分片下载成功（W25Q128 写入完成）后，更新标志区的 downloaded_size。
+下载中断后（网络断、断电），下次重新开始下载前：读取标志区 downloaded_size →擦除区1从 downloaded_size 之后的区域 → 从 offset=downloaded_size 继续下载。
+Token 过期处理：如果 token 过期，清除下载进度，重新调用检查任务获取新 token，从头下载。
+4.6 异常处理与容错（含回滚触发条件）
+异常场景
+处理策略
+是否触发回滚
+WiFi 断连
+重连 WiFi（最多5次），恢复 TCP 后从断点续传
+否（仍在下载阶段）
+HTTP 下载超时
+重试当前分片（最多3次）
+否
+W25Q128 写入失败
+尝试擦除后重新写入，3次失败后终止
+否（未设升级标志）
+MD5 校验失败
+清除区1数据，重新下载
+否
+新APP启动后看门狗复位
+BootLoader 检测 protect_flag ≠ 0xBB66BB66 → 从区2恢复旧固件
+★ 是（自动回滚）
+boot_fail_cnt >= 3
+连续3次启动失败 → 从备份区恢复旧固件
+★ 是（自动回滚）
+备份区无有效固件
+无法回滚 → 停在BootLoader → 等待重新OTA或手动烧录
+★ 是（但失败，需人工介入）
+升级中意外断电
+上电后 BootLoader 检查标志位状态，如有搬运中断痕迹则重试搬运
+取决于搬运进度
+新APP栈地址校验失败
+BootLoader 搬运完成后校验不通过 → 直接触发回滚
+★ 是（自动回滚）
+五、代码结构与实现
+5.1 推荐工程文件结构
+APP工程 (CSDN_LVGL - 副本/)├── BSP/│   ├── esp8266.c/h               # ESP8266 AT指令驱动（已有）│   └── w25q128.c/h               # W25Q128 Flash驱动（已有）├── MID/│   ├── ESP_MQTT.c/h              # MQTT通信（已有，需扩展OTA通知解析）│   ├── ota_flags.c/h             # 【新增】标志区管理（读写升级/保护标志、版本信息）│   ├── ota_task.c/h              # 【新增】OTA升级任务状态机│   └── ota_http.c/h              # 【新增】OTA HTTP客户端（签名+API调用）├── Core/Src/│   ├── main.c                    # 主程序（已有）│   └── freertos.c                # FreeRTOS任务（已有，需新增OTA任务）Boot工程 (Boot/)├── Core/Src/│   ├── main.c                    # 【需重写】完整BootLoader（含三区管理+回滚）├── BSP/│   ├── w25q128.c/h               # W25Q128驱动（从APP复用）│   └── spi.c/h                   # SPI驱动└── Drivers/                       # HAL库（已有）
+5.2 标志区数据结构设计
+以下是标志区（区3）的完整数据结构和 API。该模块在 APP 和 BootLoader 之间共享。
+// ota_flags.h — 标志区（W25Q128区3）数据结构和操作API#ifndef __OTA_FLAGS_H#define __OTA_FLAGS_H#include "w25q128.h"/* ========== 标志区地址定义（W25Q128 区3: 0x00C00000 ~ 0x00C0FFFF）========== */#define FLAGS_BASE_ADDR         0x00C00000#define FLAGS_UPGRADE_FLAG      (FLAGS_BASE_ADDR + 0x0000)  // 升级标志位 4B#define FLAGS_PROTECT_FLAG      (FLAGS_BASE_ADDR + 0x0004)  // 保护标志位 4B#define FLAGS_CURRENT_VER       (FLAGS_BASE_ADDR + 0x0010)  // 当前版本号 24B#define FLAGS_NEW_VER           (FLAGS_BASE_ADDR + 0x0030)  // 新固件版本 24B#define FLAGS_BACKUP_VER        (FLAGS_BASE_ADDR + 0x0050)  // 备份版本号 24B#define FLAGS_FW_SIZE           (FLAGS_BASE_ADDR + 0x0070)  // 新固件大小 4B#define FLAGS_BOOT_FAIL_CNT     (FLAGS_BASE_ADDR + 0x0080)  // 启动失败计数 4B#define FLAGS_DOWNLOADED_SIZE   (FLAGS_BASE_ADDR + 0x0100)  // 已下载字节数 4B (断点续传)#define FLAGS_TOKEN             (FLAGS_BASE_ADDR + 0x0200)  // OTA token 64B#define FLAGS_FILE_MD5          (FLAGS_BASE_ADDR + 0x0240)  // 固件MD5 33B/* ========== 标志位魔数定义 ========== */#define UPGRADE_MAGIC_READY     0xAA55AA55  // 区1有新固件，Boot应执行升级#define UPGRADE_MAGIC_COMMITTED 0x55AA55AA  // 固件已搬运到APP区，等待APP确认#define UPGRADE_MAGIC_NONE      0x00000000  // 无升级任务#define PROTECT_MAGIC_OK        0xBB66BB66  // APP已验证，升级成功#define PROTECT_MAGIC_NONE      0x00000000  // 待确认/未设置/* ========== 标志区操作API ========== */// 读取升级标志位static inline uint32_t Flags_ReadUpgradeFlag(void) {    uint32_t val;    W25Q128_Read(FLAGS_UPGRADE_FLAG, (uint8_t*)&val, 4);    return val;}// 设置升级标志位static inline void Flags_SetUpgradeFlag(uint32_t flag) {    // 先擦除标志区所在扇区（4KB），再写入    W25Q128_SectorErase(FLAGS_UPGRADE_FLAG);    W25Q128_Write(FLAGS_UPGRADE_FLAG, (uint8_t*)&flag, 4);}// 读取保护标志位static inline uint32_t Flags_ReadProtectFlag(void) {    uint32_t val;    W25Q128_Read(FLAGS_PROTECT_FLAG, (uint8_t*)&val, 4);    return val;}// 设置保护标志位（由新APP调用，确认升级成功）static inline void Flags_SetProtectFlag(uint32_t flag) {    W25Q128_SectorErase(FLAGS_PROTECT_FLAG);    W25Q128_Write(FLAGS_PROTECT_FLAG, (uint8_t*)&flag, 4);}// 读取/写入版本号void Flags_ReadCurrentVer(char *ver_buf);void Flags_WriteCurrentVer(const char *ver);void Flags_ReadNewVer(char *ver_buf);void Flags_WriteNewVer(const char *ver);void Flags_ReadBackupVer(char *ver_buf);void Flags_WriteBackupVer(const char *ver);// 读取/写入固件大小uint32_t Flags_ReadFwSize(void);void Flags_WriteFwSize(uint32_t size);// 启动失败计数操作（APP启动后清零，看门狗复位时递增）uint32_t Flags_ReadBootFailCnt(void);void Flags_IncBootFailCnt(void);     // BootLoader调用，递增失败计数void Flags_ClearBootFailCnt(void);   // APP确认升级成功后调用// 断点续传uint32_t Flags_ReadDownloadedSize(void);void Flags_SaveDownloadedSize(uint32_t size);// 保存/读取 Token 和 MD5void Flags_SaveToken(const char *token);void Flags_ReadToken(char *token_buf);void Flags_SaveMd5(const char *md5);void Flags_ReadMd5(char *md5_buf);#endif
+5.3 OTA 任务模块 (ota_task.c/h)
+提示：OneNET 官方提供了 C 语言 OTA SDK（基于事件驱动架构），封装了签名计算、分片下载、状态上报等底层逻辑，通过回调事件（如 OTA_EVENT_custom_save_packet、OTA_EVENT_custom_ready_update 等）与应用层交互。如果希望快速集成，推荐直接使用官方 SDK；如果希望精简代码或深度定制，可参考本文档自行实现。
+OTA 任务状态机定义：
+typedef enum {    OTA_STATE_IDLE = 0,             // 空闲，等待触发    OTA_STATE_REPORT_VERSION,       // 上报当前版本号    OTA_STATE_CHECK_TASK,           // 检查是否有升级任务    OTA_STATE_CONDITION_CHECK,      // 检查升级条件（信号/电量/空间）    OTA_STATE_DOWNLOADING,          // 分片下载固件到区1    OTA_STATE_DOWNLOAD_DONE,        // 下载+MD5校验完成    OTA_STATE_SET_FLAG_AND_RESET,   // 设置升级标志 → 软件复位    OTA_STATE_REPORT_RESULT,        // 新APP启动后上报升级成功    OTA_STATE_REPORT_ROLLBACK,      // 回滚后旧APP上报失败    OTA_STATE_ERROR                 // 错误状态} OTA_State_t;// OTA 任务上下文typedef struct {    OTA_State_t state;    char        target_ver[24];     // 目标版本号    uint32_t    file_size;          // 固件总大小    char        file_md5[33];       // 固件MD5    char        token[64];          // 下载token    char        download_ip[32];    // 下载服务器IP    uint8_t     retry_count;    uint8_t     max_retry;} OTA_Ctx_t;
+5.4 HTTP 客户端模块 (ota_http.c/h)
+关键函数接口：
+void OTA_HTTP_Init(const char *access_key, const char *product_id)
+初始化，传入产品 access_key 和 product_id，内部缓存 Authorization 签名计算参数。
+int OTA_HTTP_ReportVersion(const char *dev_id, const char *version)
+上报版本号。返回 0 成功。
+int OTA_HTTP_CheckTask(const char *dev_id, const char *version, OTA_Ctx_t *ctx)
+检查升级任务，结果填充到 ctx。返回 0=有任务，1=无任务。
+int OTA_HTTP_DownloadChunk(const char *token, uint32_t offset, uint32_t end, uint8_t *buf, uint16_t *len)
+分片下载。返回 0=成功(206)，<0=错误。
+int OTA_HTTP_ReportProgress(const char *dev_id, const char *token, uint8_t step)
+上报下载进度（progress接口，step: 0~100）。
+int OTA_HTTP_ReportResult(const char *dev_id, const char *token, uint16_t result)
+上报升级结果（report接口，result: 101=下载成功, 201=升级成功, 2xx=失败）。
+Authorization 签名生成（基于 mbedtls 库）：
+#include "mbedtls/md.h"#include "mbedtls/base64.h"int OTA_GenerateAuth(const char *access_key, const char *product_id,                     char *auth_out, uint16_t auth_size){    uint32_t et = get_unix_time() + 86400;  // 过期时间=当前+24h    char sign_str[256];    snprintf(sign_str, sizeof(sign_str), "%lu\nsha1\nproducts/%s\n2018-10-31",             et, product_id);    uint8_t hmac_key[64];   size_t key_len;    mbedtls_base64_decode(hmac_key, sizeof(hmac_key), &key_len,                          (const uint8_t *)access_key, strlen(access_key));    uint8_t hmac_result[20];    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA1),                    hmac_key, key_len,                    (const uint8_t *)sign_str, strlen(sign_str), hmac_result);    char sign_b64[64];   size_t b64_len;    mbedtls_base64_encode((uint8_t *)sign_b64, sizeof(sign_b64), &b64_len,                          hmac_result, sizeof(hmac_result));    snprintf(auth_out, auth_size,        "version=2018-10-31&res=products%%2F%s&et=%lu&method=sha1&sign=%s",        product_id, et, sign_b64);    return 0;}
+5.5 BootLoader 完整代码（含备份与回滚）
+以下是 BootLoader 的完整主逻辑代码。相比第一版增加了：① 三区标志读取与判断、② 旧固件备份到区2、③ 升级失败自动回滚、④ 启动失败计数。
+// BootLoader main.c — 完整OTA三区管理版本#include "main.h"#include "usart.h"#include "gpio.h"#include "spi.h"#include "w25q128.h"#include "ota_flags.h"    // 标志区操作API#include <stdio.h>#define FLASH_APP_ADDR      0x08010000#define FLASH_APP_MAX_SIZE  (960 * 1024)#define W25Q_ZONE1_ADDR     0x00000000   // 区1：升级固件区#define W25Q_ZONE2_ADDR     0x00600000   // 区2：备份区typedef void (*pFunction)(void);pFunction Jump_To_Application;// 前向声明void Jump_to_APP(uint32_t app_addr);uint32_t GetSectorNum(uint32_t addr);void Flash_EraseAppArea(uint32_t size);int  Flash_WriteApp(uint32_t flash_addr, uint32_t w25q_addr, uint32_t size);int  VerifyAppStack(uint32_t addr);int main(void){    HAL_Init();    SystemClock_Config();    MX_GPIO_Init();    MX_USART2_UART_Init();    MX_SPI1_Init();    W25Q128_Init();    printf("\r\n========================================\r\n");    printf("  OTA BootLoader V2.0 (三区管理+回滚)    \r\n");    printf("========================================\r\n");    // ============ 第1步：读取标志区关键字段 ============    uint32_t upgrade_flag = Flags_ReadUpgradeFlag();    uint32_t protect_flag = Flags_ReadProtectFlag();    uint32_t boot_fail    = Flags_ReadBootFailCnt();    printf("[Boot] 升级标志=0x%08X  保护标志=0x%08X  失败计数=%lu\r\n",           upgrade_flag, protect_flag, boot_fail);    // ============ 第2步：决策 ============    // 情况A：无升级任务 → 直接跳转APP    if (upgrade_flag == UPGRADE_MAGIC_NONE) {        printf("[Boot] 无升级任务\r\n");        if (VerifyAppStack(FLASH_APP_ADDR)) {            Jump_to_APP(FLASH_APP_ADDR);        } else {            // APP区损坏，尝试从备份区恢复            printf("[Boot] APP区无效！尝试从备份区恢复...\r\n");            if (Flash_WriteApp(FLASH_APP_ADDR, W25Q_ZONE2_ADDR,                               Flags_ReadFwSize()) == 0) {                printf("[Boot] 备份恢复成功\r\n");                Jump_to_APP(FLASH_APP_ADDR);            }            printf("[Boot] 恢复失败，设备停机等待手动烧录\r\n");            while (1) { HAL_Delay(1000); }        }    }    // 情况B：首次检测到升级任务（upgrade=AA55, protect=0）    if (upgrade_flag == UPGRADE_MAGIC_READY &&        protect_flag == PROTECT_MAGIC_NONE) {        printf("[Boot] ===== 开始OTA升级流程 =====\r\n");        uint32_t fw_size = Flags_ReadFwSize();        // ★ B1. 擦除APP区        printf("[Boot] 步骤1：擦除片上Flash APP区...\r\n");        Flash_EraseAppArea(fw_size);        // ★ B2. 从升级固件区（区1）搬运新固件到APP区        printf("[Boot] 步骤2：从W25Q128区1搬运新固件到APP区...\r\n");        if (Flash_WriteApp(FLASH_APP_ADDR, W25Q_ZONE1_ADDR, fw_size) != 0) {            printf("[Boot] 搬运失败！触发回滚...\r\n");            goto ROLLBACK;        }        // B3. 校验栈地址        if (!VerifyAppStack(FLASH_APP_ADDR)) {            printf("[Boot] 新固件校验失败！触发回滚...\r\n");            goto ROLLBACK;        }        // B4. 更新标志：升级标志改为"已搬运待确认"        Flags_SetUpgradeFlag(UPGRADE_MAGIC_COMMITTED);  // 0x55AA55AA        Flags_IncBootFailCnt();  // 启动失败计数+1（为回滚做准备）        printf("[Boot] 搬运完成，准备跳转新APP\r\n");        Jump_to_APP(FLASH_APP_ADDR);    }    // 情况C：已搬运但APP未确认（upgrade=55AA, protect≠BB66）    // ★★★ 触发回滚 ★★★    if (upgrade_flag == UPGRADE_MAGIC_COMMITTED &&        protect_flag != PROTECT_MAGIC_OK) {        // 回滚阈值判断        if (boot_fail >= 3) {            printf("[Boot] 启动失败次数=%lu (>=3)，触发强制回滚！\r\n", boot_fail);        } else {            // 可能是偶发复位，再给一次机会            Flags_IncBootFailCnt();            printf("[Boot] 警告：APP未确认升级(失败计数=%lu)，尝试再次启动...\r\n",                   boot_fail + 1);            if (VerifyAppStack(FLASH_APP_ADDR)) {                Jump_to_APP(FLASH_APP_ADDR);            }            // APP区损坏，进入回滚        }ROLLBACK:        printf("\r\n[Boot] ★★★★★ 触发固件回滚 ★★★★★\r\n");        // R1. 从备份区（区2）恢复旧固件        uint32_t fw_size = Flags_ReadFwSize();        printf("[Boot] 从W25Q128备份区恢复固件 (地址=0x%08X, 大小=%lu)\r\n",               W25Q_ZONE2_ADDR, fw_size);        Flash_EraseAppArea(fw_size);        if (Flash_WriteApp(FLASH_APP_ADDR, W25Q_ZONE2_ADDR, fw_size) != 0) {            printf("[Boot] ★ 回滚失败！备份区数据损坏！设备变砖！★\r\n");            while (1) { HAL_Delay(1000); }        }        if (!VerifyAppStack(FLASH_APP_ADDR)) {            printf("[Boot] ★ 回滚后APP仍无效！设备变砖！★\r\n");            while (1) { HAL_Delay(1000); }        }        // R2. 清除所有标志        Flags_SetUpgradeFlag(UPGRADE_MAGIC_NONE);        Flags_SetProtectFlag(PROTECT_MAGIC_NONE);        Flags_ClearBootFailCnt();        char backup_ver[24];        Flags_ReadBackupVer(backup_ver);        Flags_WriteCurrentVer(backup_ver);  // 恢复版本号        printf("[Boot] ===== 回滚完成！跳转回旧APP (版本=%s) =====\r\n", backup_ver);        Jump_to_APP(FLASH_APP_ADDR);    }    // 情况D：升级已完成且已验证（upgrade=55AA, protect=BB66）    if (upgrade_flag == UPGRADE_MAGIC_COMMITTED &&        protect_flag == PROTECT_MAGIC_OK) {        printf("[Boot] 升级已确认完成\r\n");        Flags_SetUpgradeFlag(UPGRADE_MAGIC_NONE);        Flags_ClearBootFailCnt();        Jump_to_APP(FLASH_APP_ADDR);    }    // 默认：尝试跳转APP    if (VerifyAppStack(FLASH_APP_ADDR)) {        Jump_to_APP(FLASH_APP_ADDR);    }    printf("[Boot] 无可用的APP固件，设备停机\r\n");    while (1) { HAL_Delay(1000); }}// ============ 辅助函数 ============void Jump_to_APP(uint32_t app_addr){    uint32_t JumpAddress;    printf("[Boot] 跳转到APP: 0x%08X\r\n", app_addr);    HAL_UART_DeInit(&huart2);    HAL_DeInit();    SysTick->CTRL = 0;    __set_PRIMASK(1);    JumpAddress = *(volatile uint32_t*)(app_addr + 4);    Jump_To_Application = (pFunction)JumpAddress;    __set_MSP(*(volatile uint32_t*)app_addr);    Jump_To_Application();}int VerifyAppStack(uint32_t addr) {    uint32_t sp = *(volatile uint32_t *)addr;    return ((sp & 0x2FFE0000) == 0x20000000) ? 1 : 0;}void Flash_EraseAppArea(uint32_t size) {    // 简化版：按16KB扇区擦除（STM32F4低地址扇区为16KB）    uint32_t end_addr = FLASH_APP_ADDR + size;    HAL_FLASH_Unlock();    FLASH_EraseInitTypeDef erase = {0};    erase.TypeErase = FLASH_TYPEERASE_SECTORS;    erase.Sector = FLASH_SECTOR_1;  // 0x08010000在Sector1(16KB)    // 实际需要遍历所有相关扇区，这里简化    uint32_t sector_error;    HAL_FLASHEx_Erase(&erase, &sector_error);    HAL_FLASH_Lock();}int Flash_WriteApp(uint32_t flash_addr, uint32_t w25q_addr, uint32_t size) {    uint8_t buf[256];    HAL_FLASH_Unlock();    for (uint32_t off = 0; off < size; off += 256) {        uint32_t chunk = (size - off > 256) ? 256 : (size - off);        W25Q128_Read(w25q_addr + off, buf, chunk);        for (uint32_t i = 0; i < chunk; i += 4) {            uint32_t word = *(uint32_t *)(buf + i);            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,                                  flash_addr + off + i, word) != HAL_OK) {                HAL_FLASH_Lock();                return -1;            }        }    }    HAL_FLASH_Lock();    return 0;}
+5.6 MQTT 集成 OTA 通知接收
+// 扩展 ESP_MQTT_MsgProcess() 以支持OTA通知void ESP_MQTT_MsgProcess(void){    if (tcp_rx_flag == 0) return;    tcp_rx_flag = 0;    printf("[MQTT] 下发消息：%s\r\n", TCPdata);    // 检测OTA升级通知（平台通过property/set下发）    if (strstr(TCPdata, "\"ota\"") || strstr(TCPdata, "\"upgrade\"")) {        printf("[MQTT] ★ 收到OTA升级通知！激活OTA任务\r\n");        osSemaphoreRelease(OTA_TriggerSemHandle);    }}
+5.7 FreeRTOS OTA 任务示例
+5.7.1 OTA 下载任务
+// OTA 下载任务（在 APP 中运行）void OTA_Task(void *argument){    vTaskDelay(pdMS_TO_TICKS(5000));  // 等待WiFi+MQTT就绪    // 启动时检查是否需要上报升级结果    uint32_t upgrade_flag = Flags_ReadUpgradeFlag();    uint32_t protect_flag = Flags_ReadProtectFlag();    if (upgrade_flag == UPGRADE_MAGIC_COMMITTED &&        protect_flag == PROTECT_MAGIC_OK) {        // 这是升级成功的新APP首次运行        printf("[OTA] 升级成功！上报结果...\r\n");        char token[64];  Flags_ReadToken(token);        OTA_HTTP_ReportResult(MY_DEV_ID, token, 201);  // 上报升级成功（report接口）        char new_ver[24];  Flags_ReadNewVer(new_ver);        OTA_HTTP_ReportVersion(MY_DEV_ID, new_ver);      // 上报新版本号        Flags_ClearBootFailCnt();        Flags_SetUpgradeFlag(UPGRADE_MAGIC_NONE);    }    else if (upgrade_flag == UPGRADE_MAGIC_COMMITTED &&             protect_flag != PROTECT_MAGIC_OK) {        // 这是回滚后的旧APP        printf("[OTA] 检测到升级失败回滚，上报失败...\r\n");        char token[64];  Flags_ReadToken(token);        OTA_HTTP_ReportResult(MY_DEV_ID, token, 206);  // 上报升级失败（report接口）        Flags_SetUpgradeFlag(UPGRADE_MAGIC_NONE);        Flags_ClearBootFailCnt();    }    // 主循环    while (1)    {        // 等待OTA触发信号量（MQTT通知或定时器）        if (osSemaphoreAcquire(OTA_TriggerSemHandle, pdMS_TO_TICKS(30*60*1000))            != osOK) {            // 30分钟超时 = 定时轮询        }        // 1. 上报版本号        char cur_ver[24];  Flags_ReadCurrentVer(cur_ver);        OTA_HTTP_ReportVersion(MY_DEV_ID, cur_ver);        // 2. 检查升级任务        OTA_Ctx_t ctx = {0};        int ret = OTA_HTTP_CheckTask(MY_DEV_ID, cur_ver, &ctx);        if (ret != 0) continue;  // 无任务        // 3. 版本比较（避免重复升级）        if (strcmp(ctx.target_ver, cur_ver) == 0) continue;        printf("[OTA] 发现新版本: %s -> %s\r\n", cur_ver, ctx.target_ver);        // 4. 保存token和MD5到标志区        Flags_SaveToken(ctx.token);        Flags_SaveMd5(ctx.file_md5);        Flags_WriteNewVer(ctx.target_ver);        Flags_WriteFwSize(ctx.file_size);        // 5. 分片下载固件到区1        if (OTA_DownloadToZone1(ctx.token, ctx.file_size,                                ctx.download_ip) != 0) {            printf("[OTA] 下载失败\r\n");            continue;        }        // 6. MD5校验        if (OTA_VerifyMd5(W25Q_ZONE1_ADDR, ctx.file_size, ctx.file_md5) != 0) {            printf("[OTA] MD5校验失败，重新下载\r\n");            OTA_HTTP_ReportResult(MY_DEV_ID, ctx.token, 205);            continue;        }        // 7. ★ 设置升级标志 → BootLoader下次启动会处理        Flags_SetUpgradeFlag(UPGRADE_MAGIC_READY);  // 0xAA55AA55        // 8. 上报下载完成        OTA_HTTP_ReportProgress(MY_DEV_ID, ctx.token, 100);  // step=100: 下载完成，状态切换为"正在升级"        // 9. 软件复位，进入BootLoader        printf("[OTA] 3秒后复位，进入BootLoader升级流程...\r\n");        vTaskDelay(pdMS_TO_TICKS(3000));        NVIC_SystemReset();    }}
+5.7.2 APP 启动确认与固件备份
+// 在 APP 主初始化完成后（如 ESP_RxTask 的第一个循环中）调用void OTA_ConfirmBootSuccess(void){    uint32_t upgrade_flag = Flags_ReadUpgradeFlag();    if (upgrade_flag == UPGRADE_MAGIC_COMMITTED) {        // BootLoader已搬运新固件，现在是新固件首次运行        uint32_t fw_size = Flags_ReadFwSize();        // ★ 步骤1：备份新固件到备份区（区1 → 区2）        // 区2保存已验证成功的最新版本，用于下次升级失败时回滚        printf("[OTA] 备份新固件到备份区...");        for (uint32_t addr = W25Q_ZONE2_ADDR;             addr < W25Q_ZONE2_ADDR + fw_size; addr += 65536) {            W25Q128_BlockErase_64K(addr);        }        uint8_t buf[256];        for (uint32_t off = 0; off < fw_size; off += 256) {            uint32_t chunk = (fw_size - off > 256) ? 256 : (fw_size - off);            W25Q128_Read(W25Q_ZONE1_ADDR + off, buf, chunk);            W25Q128_Write(W25Q_ZONE2_ADDR + off, buf, chunk);        }        printf("[OTA] 备份完成");        // ★ 步骤2：写入保护标志确认升级成功        Flags_SetProtectFlag(PROTECT_MAGIC_OK);  // 0xBB66BB66        // 步骤3：更新标志区版本号        char new_ver[24];  Flags_ReadNewVer(new_ver);        Flags_WriteCurrentVer(new_ver);        Flags_WriteBackupVer(new_ver);        // 步骤4：清除启动失败计数        Flags_ClearBootFailCnt();        printf("[OTA] 升级确认完成，保护标志已写入");    }}// 注意：如果此函数未能执行（APP崩溃导致看门狗复位），// BootLoader检测到protect_flag≠0xBB66BB66而触发回滚。// 此时区2中仍是上一个成功版本，可以安全恢复。
+六、参考资料
+1. OneNET OTA 远程升级介绍：https://open.iot.10086.cn/doc/book/device-develop/OTA/远程升级OTA介绍.html
+2. OneNET OTA 南向 API 列表：https://open.iot.10086.cn/doc/book/device-develop/OTA/develop/south-API/api-list.html
+3. OneNET OTA 升级操作流程：https://open.iot.10086.cn/doc/ota/book/manual/ota_develop_document.html
+4. OneNET OTA 开发指南总览：https://open.iot.10086.cn/doc/ota/
+5. 上报设备版本号 API：https://open.iot.10086.cn/doc/aiot/fuse/detail/1504
+6. 下载升级包 API：https://open.iot.10086.cn/doc/aiot/develop/detail/1074
+7. OneNET 开发者中心：https://open.iot.10086.cn/
+8. mbedtls 加密库：https://github.com/Mbed-TLS/mbedtls
+9. cJSON 轻量级 JSON 解析库：https://github.com/DaveGamble/cJSON
+10. W25Q128 数据手册：https://www.winbond.com/
+11. STM32F407 参考手册（Flash编程章节）：https://www.st.com/
+---
+文档结束

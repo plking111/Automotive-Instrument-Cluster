@@ -1,0 +1,31 @@
+# ---- Keil MDK-ARM 编译输出 ----
+*.o
+*.crf
+*.d
+*.axf
+*.hex
+*.map
+*.htm
+*.dep
+*.lnp
+*.lst
+*.build_log.htm
+*.iex
+*.sct
+*.sct.Bak
+*.uvguix.pl
+build.log
+build_test.log
+DebugConfig/
+RTE/
+
+# ---- 参考资料 / 大文件（不提交）----
+资料参考/
+
+# ---- 本地配置 ----
+.claude/
+.vscode/
+*.bak
+
+# ---- 论文/文档（暂不提交，如需提交请删除此行）----
+/车载智能仪表盘系统设计与实现.docx
