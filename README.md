@@ -48,24 +48,25 @@
    - 标志区使用 R‑M‑E‑W 读改写机制，适配 SPI Flash 擦写特性
 
 ### 工程文件说明
-Boot/        # F407 BootLoader引导工程
-APP/         # F407主控APP主工程
-F1_1/        # F103‑A数据采集从机
-F1_2/        # F103‑B按键告警从机
+- `Boot/`        # F407 BootLoader引导工程
+- `APP/`         # F407主控APP主工程
+- `F1_1/`        # F103‑A数据采集从机
+- `F1_2/`        # F103‑B按键告警从机
 
 ## ⚙️ 用户配置参数（使用前务必修改）
 需要根据自己 OneNET 平台设备信息、WiFi 信息修改以下头文件宏定义：
-1.MID/ota_http.h OTA 升级相关平台参数
-OTA_PRODUCT_ID      ""    // OneNET产品ID
-OTA_DEVICE_NAME     ""    // 设备名称
-OTA_USER_ID         ""    // 用户ID
-OTA_AUTHORIZATION   ""    // 鉴权token
-2.MID/ESP_MQTT.h MQTT 与 WiFi 配置
-MQTT_PRODUCT_ID     ""     // OneNET产品ID
-MQTT_DEVICE_NAME    ""     // 设备名称
-MQTT_AUTH_PARAM     ""     // MQTT鉴权参数
-USER_SSID           ""     // 连接WiFi名称
-USER_PASS           ""     // WiFi密码
+1. **`MID/ota_http.h`** OTA 升级相关平台参数  
+`OTA_PRODUCT_ID      ""`    // OneNET产品ID  
+`OTA_DEVICE_NAME     ""`    // 设备名称  
+`OTA_USER_ID         ""`    // 用户ID  
+`OTA_AUTHORIZATION   ""`    // 鉴权token  
+2. **`MID/ESP_MQTT.h`** MQTT 与 WiFi 配置  
+`MQTT_PRODUCT_ID     ""`     // OneNET产品ID  
+`MQTT_DEVICE_NAME    ""`     // 设备名称  
+`MQTT_AUTH_PARAM     ""`     // MQTT鉴权参数  
+`USER_SSID           ""`     // 连接WiFi名称  
+`USER_PASS           ""`     // WiFi密码
+
 
 ## 📚 复刻本项目需要掌握的知识
 - BootLoader 原理、STM32 启动流程、中断向量表重定向、片上 Flash 分区管理
